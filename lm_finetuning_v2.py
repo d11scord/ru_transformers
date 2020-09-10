@@ -25,7 +25,6 @@ import argparse
 import glob
 import logging
 import os
-import pickle
 import random
 import regex as re
 import shutil
@@ -35,10 +34,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset, SequentialSampler, RandomSampler
 from torch.utils.data.distributed import DistributedSampler
 
-# try:
 from torch.utils.tensorboard import SummaryWriter
-# except:
-#     from tensorboardX import SummaryWriter
 
 from tqdm import tqdm, trange
 from dataclasses import dataclass
@@ -88,7 +84,8 @@ class MovingLoss():
 def print_sample(model, tokenizer, device, args):
     model.eval()
     raw_text = """ <BOS> """
-    context_tokens = tokenizer.encode(raw_text)
+    bos_id = 2
+    context_tokens = [bos_id] + tokenizer.encode(raw_text)
     out = sample_sequence(
         model=model,
         context=context_tokens,
@@ -111,37 +108,22 @@ def print_sample(model, tokenizer, device, args):
 
 class TextDataset(Dataset):
     @staticmethod
-    def process_file(file_path, tokenizer, block_size, shuffle):
-        directory, filename = os.path.split(file_path)
-        directory = os.path.join(directory, 'cached')
-        os.makedirs(directory, exist_ok=True)
-        cached_features_file = os.path.join(directory, f'cached_lm_{block_size}_{tokenizer.hash}_{filename}')
-
-        if os.path.exists(cached_features_file):
-            with open(cached_features_file, 'rb') as handle:
-                tokenized_text = pickle.load(handle)
-        else:
-            with open(file_path, encoding="utf-8") as f:
-                text = f.read()
-            if hasattr(tokenizer, 'encode'):
-                tokenized_text = tokenizer.encode(text)
-            else:
-                tokenized_text = tokenizer.convert_tokens_to_ids(tokenizer.tokenize(text))
-            with open(cached_features_file, 'wb') as handle:
-                pickle.dump(tokenized_text, handle, protocol=pickle.HIGHEST_PROTOCOL)
+    def process_file(file_path, tokenizer, block_size, _):
+        with open(file_path, encoding="utf-8") as f:
+            text = f.readlines()
 
         examples = []
 
-        # add random shift
-        max_shift = max(min(block_size, len(tokenized_text) - block_size), 0)
-        rnd_shift = random.randrange(max_shift) if max_shift and shuffle else 0
+        bos_token_id, eos_token_id, pad_token_id = 2, 3, 0  # From YTEncoder vocab
+        for row in text:
+            if len(row) > block_size:
+                continue
+            joke = tokenizer.encode(row, bos=False, eos=False)
+            encoded = [bos_token_id] + joke + [eos_token_id]
+            tokens = encoded + [pad_token_id] * (block_size - len(encoded))
+            labels = [-1] + encoded[1:len(encoded) - 1] + [-1] * (block_size - len(encoded) + 1)
+            examples.append((tokens, labels))
 
-        for i in range(rnd_shift, len(tokenized_text) - block_size + 1, block_size):
-            examples.append(tokenizer.add_special_tokens_single_sentence(tokenized_text[i:i + block_size]))
-
-        # Note that we are loosing the last truncated example here for the sake of simplicity (no padding)
-        # If your dataset is small, first you should look for a bigger one :-) and second you
-        # can change this behavior by adding (model specific) padding.
         return examples
 
     def __init__(self, tokenizer, file_path='train', args=None, shuffle=True):
@@ -177,6 +159,7 @@ def load_and_cache_examples(args, tokenizer, evaluate=False):
 
 
 def set_seed(args):
+    # return  # no
     random.seed(args.seed)
     np.random.seed(args.seed)
     torch.manual_seed(args.seed)
@@ -347,11 +330,13 @@ def train(args, train_dataset, model, tokenizer):
         for _ in train_iterator:
             epoch_iterator = tqdm(train_dataloader, desc="Iteration", disable=args.local_rank not in [-1, 0])
             for step, batch in enumerate(epoch_iterator):
-                inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+                # inputs, labels = mask_tokens(batch, tokenizer, args) if args.mlm else (batch, batch)
+                inputs, labels = (batch[:, 0, :], batch[:, 1, :])
                 inputs = inputs.to(args.device)
                 labels = labels.to(args.device)
                 model.train()
-                outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
+                # outputs = model(inputs, masked_lm_labels=labels) if args.mlm else model(inputs, labels=labels)
+                outputs = model(inputs, labels=labels)
                 loss = outputs[0]  # model outputs are always tuple in pytorch-transformers (see doc)
 
                 if args.n_gpu > 1:
@@ -434,10 +419,12 @@ def evaluate(args, model, tokenizer, prefix=""):
     model.eval()
 
     for batch in tqdm(eval_dataloader, desc="Evaluating"):
-        batch = batch.to(args.device)
+        inputs, labels = (batch[:, 0, :], batch[:, 1, :])
+        inputs = inputs.to(args.device)
+        labels = labels.to(args.device)
 
         with torch.no_grad():
-            outputs = model(batch, masked_lm_labels=batch) if args.mlm else model(batch, labels=batch)
+            outputs = model(inputs, labels=labels)
             lm_loss = outputs[0]
             eval_loss += lm_loss.item()  # lm_loss.mean().item()
         nb_eval_steps += 1
@@ -606,17 +593,17 @@ def main():
         torch.distributed.barrier()  # Barrier to make sure only the first process in distributed training download model & vocab
 
     config_class, model_class, tokenizer_class = MODEL_CLASSES[args.model_type]
-    config = config_class.from_pretrained(args.model_name_or_path)
+    config = GPT2Config.from_pretrained(args.model_name_or_path)
     if args.tokenizer_class: tokenizer_class = globals()[args.tokenizer_class]
-    tokenizer = tokenizer_class.from_pretrained(args.model_name_or_path,
-                                                do_lower_case=args.do_lower_case)
+    tokenizer = YTEncoder.from_pretrained(args.model_name_or_path,
+                                          do_lower_case=args.do_lower_case)
 
     if args.block_size <= 0:
         args.block_size = tokenizer.max_len_single_sentence  # Our input block size will be the max possible for the model
     args.block_size = min(args.block_size, tokenizer.max_len_single_sentence)
 
-    model = model_class.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
-                                        config=config)
+    model = GPT2LMHeadModel.from_pretrained(args.model_name_or_path, from_tf=bool('.ckpt' in args.model_name_or_path),
+                                            config=config)
     model.to(args.device)
 
     print(200 * '/')
